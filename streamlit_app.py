@@ -8,13 +8,13 @@ from torch import nn
 from torchvision import transforms
 
 try:
-    from openai import OpenAI
+    from groq import Groq
 except ImportError:
-    OpenAI = None
+    Groq = None
 
 
 MODEL_PATH = Path("neu_defect_compact_cnn.pth")
-DEFAULT_OPENAI_MODEL = "gpt-5-mini"
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 
 DEFECT_INFO = {
     "crazing": (
@@ -155,10 +155,10 @@ def read_secret(name: str) -> str | None:
 
 
 @st.cache_resource
-def load_openai_client(api_key: str):
-    if OpenAI is None:
+def load_groq_client(api_key: str):
+    if Groq is None:
         return None
-    return OpenAI(api_key=api_key)
+    return Groq(api_key=api_key)
 
 
 def format_latest_prediction() -> str:
@@ -180,13 +180,13 @@ def format_latest_prediction() -> str:
     return "\n".join(lines)
 
 
-def answer_with_openai(prompt: str, class_names: list[str]) -> str | None:
-    api_key = read_secret("OPENAI_API_KEY")
+def answer_with_groq(prompt: str, class_names: list[str]) -> str | None:
+    api_key = read_secret("GROQ_API_KEY")
     if not api_key:
         return None
 
-    model_name = read_secret("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
-    client = load_openai_client(api_key)
+    model_name = read_secret("GROQ_MODEL") or DEFAULT_GROQ_MODEL
+    client = load_groq_client(api_key)
     if client is None:
         return None
 
@@ -230,16 +230,18 @@ grade, loading condition, and inspection standard when relevant.
 """
 
     try:
-        response = client.responses.create(
+        response = client.chat.completions.create(
             model=model_name,
-            instructions=instructions,
-            input=user_input,
-            max_output_tokens=350,
+            messages=[
+                {"role": "system", "content": instructions},
+                {"role": "user", "content": user_input},
+            ],
+            temperature=0.2,
         )
-        return response.output_text
+        return response.choices[0].message.content
     except Exception as error:
         return (
-            "I could not reach the chatbot API just now. "
+            "I could not reach the Groq chatbot API just now. "
             f"Technical detail: {error}"
         )
 
@@ -278,7 +280,7 @@ def answer_with_rules(prompt: str, class_names: list[str]) -> str:
     return (
         "Upload a defect image for classification, ask me about a defect "
         "type such as scratches, crazing, inclusion, patches, pitted surface, "
-        "or rolled-in scale, or add OPENAI_API_KEY in Streamlit Secrets for "
+        "or rolled-in scale, or add GROQ_API_KEY in Streamlit Secrets for "
         "natural chatbot answers."
     )
 
@@ -296,7 +298,7 @@ def answer_question(prompt: str, class_names: list[str]) -> str:
     if wants_class_list:
         return answer_with_rules(prompt, class_names)
 
-    api_answer = answer_with_openai(prompt, class_names)
+    api_answer = answer_with_groq(prompt, class_names)
     if api_answer:
         return api_answer
 

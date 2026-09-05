@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import streamlit as st
@@ -6,8 +7,14 @@ from PIL import Image
 from torch import nn
 from torchvision import transforms
 
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
 
 MODEL_PATH = Path("neu_defect_compact_cnn.pth")
+DEFAULT_OPENAI_MODEL = "gpt-5-mini"
 
 DEFECT_INFO = {
     "crazing": (
@@ -137,7 +144,107 @@ def add_message(role: str, content: str) -> None:
     st.session_state.messages.append({"role": role, "content": content})
 
 
-def answer_question(prompt: str, class_names: list[str]) -> str:
+def read_secret(name: str) -> str | None:
+    value = os.getenv(name)
+    try:
+        if name in st.secrets:
+            value = st.secrets[name]
+    except Exception:
+        pass
+    return value
+
+
+@st.cache_resource
+def load_openai_client(api_key: str):
+    if OpenAI is None:
+        return None
+    return OpenAI(api_key=api_key)
+
+
+def format_latest_prediction() -> str:
+    prediction = st.session_state.get("last_prediction")
+    if prediction is None:
+        return "No image has been classified yet."
+
+    lines = [
+        f"Latest predicted defect class: {prediction['class']}",
+        f"Prediction confidence: {prediction['confidence'] * 100:.2f}%",
+    ]
+
+    ranked_predictions = prediction.get("ranked_predictions", [])
+    if ranked_predictions:
+        lines.append("Class probabilities:")
+        for class_name, probability in ranked_predictions:
+            lines.append(f"- {class_name}: {probability * 100:.2f}%")
+
+    return "\n".join(lines)
+
+
+def answer_with_openai(prompt: str, class_names: list[str]) -> str | None:
+    api_key = read_secret("OPENAI_API_KEY")
+    if not api_key:
+        return None
+
+    model_name = read_secret("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
+    client = load_openai_client(api_key)
+    if client is None:
+        return None
+
+    recent_chat = st.session_state.messages[-8:]
+    chat_context = "\n".join(
+        f"{message['role']}: {message['content']}" for message in recent_chat
+    )
+
+    defect_notes = "\n".join(
+        f"- {class_name}: {DEFECT_INFO.get(class_name, 'Trained defect category.')}"
+        for class_name in class_names
+    )
+
+    user_input = f"""
+User question:
+{prompt}
+
+Current model result:
+{format_latest_prediction()}
+
+Available defect classes:
+{", ".join(class_names)}
+
+Defect reference notes:
+{defect_notes}
+
+Recent conversation:
+{chat_context}
+"""
+
+    instructions = """
+You are a helpful steel surface defect assistant inside a Streamlit app.
+The PyTorch model has already classified the uploaded image; use that result
+as context when the user says "this", "it", or "the defect".
+
+Answer naturally and briefly. Explain defect meaning, likely seriousness,
+relative severity, and practical next steps when asked. Do not claim final
+industrial safety, acceptance, rejection, or failure risk from the image alone.
+Mention that real severity depends on defect depth, size, location, material
+grade, loading condition, and inspection standard when relevant.
+"""
+
+    try:
+        response = client.responses.create(
+            model=model_name,
+            instructions=instructions,
+            input=user_input,
+            max_output_tokens=350,
+        )
+        return response.output_text
+    except Exception as error:
+        return (
+            "I could not reach the chatbot API just now. "
+            f"Technical detail: {error}"
+        )
+
+
+def answer_with_rules(prompt: str, class_names: list[str]) -> str:
     lower_prompt = prompt.lower().strip()
 
     if "class" in lower_prompt or "category" in lower_prompt:
@@ -169,10 +276,31 @@ def answer_question(prompt: str, class_names: list[str]) -> str:
         )
 
     return (
-        "Upload a defect image for classification, or ask me about a defect "
+        "Upload a defect image for classification, ask me about a defect "
         "type such as scratches, crazing, inclusion, patches, pitted surface, "
-        "or rolled-in scale."
+        "or rolled-in scale, or add OPENAI_API_KEY in Streamlit Secrets for "
+        "natural chatbot answers."
     )
+
+
+def answer_question(prompt: str, class_names: list[str]) -> str:
+    lower_prompt = prompt.lower().strip()
+    wants_class_list = (
+        lower_prompt in {"class", "classes", "category", "categories"}
+        or "what classes" in lower_prompt
+        or "list classes" in lower_prompt
+        or "show classes" in lower_prompt
+        or "available classes" in lower_prompt
+    )
+
+    if wants_class_list:
+        return answer_with_rules(prompt, class_names)
+
+    api_answer = answer_with_openai(prompt, class_names)
+    if api_answer:
+        return api_answer
+
+    return answer_with_rules(prompt, class_names)
 
 
 st.set_page_config(page_title="Steel Defect Chatbot", page_icon="🔍", layout="centered")
@@ -226,6 +354,7 @@ if uploaded_file is not None:
         st.session_state.last_prediction = {
             "class": predicted_class,
             "confidence": confidence,
+            "ranked_predictions": ranked_predictions,
         }
 
         add_message("user", f"Uploaded image: {uploaded_file.name}")
